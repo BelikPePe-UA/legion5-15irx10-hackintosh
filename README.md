@@ -63,6 +63,18 @@
 | **OpenCL (найкращий)** | **28076** |
 | OpenCL (інший прогін) | 21875 |
 
+### Скриншоти результатів
+
+| CPU (EPP 0) | GPU Metal | GPU OpenCL |
+|---|---|---|
+| ![CPU](gb-cpu.jpg) | ![Metal](gb-metal.jpg) | ![OpenCL](gb-opencl.jpg) |
+
+Посилання: [CPU 2264/14128](https://browser.geekbench.com/v6/cpu/19372956) · [Metal 88679](https://browser.geekbench.com/v6/compute/6945805) · [OpenCL 28076](https://browser.geekbench.com/v6/compute/6945808)
+
+**YouTube 4K@60 (VP9):** 3840×2160, пропущено лише 8 кадрів із 2872.
+
+![YouTube 4K](youtube-4k.jpg)
+
 ### Графіка робочого столу та мережа
 
 | Тест | До | Після |
@@ -106,14 +118,26 @@ VoodooI2C з урахуванням GPIO-контролера Raptor Lake (7A7D)
 - Результат: Geekbench **2216 / 14438** (було 1799 / 12079). У простої ~8 Вт, температура нормальна.
 - Урок: `IOMappedRead64` приймає **фізичну** адресу. Одна з ранніх версій kext через це викликала паніку.
 
-### 6. Fn+Q (режими Legion: Тихий / Баланс / Продуктивність)
-EC перемикає режим сам. Власний **FnQNotify.kext** ловить WMI-подію `LENOVO_GAMEZONE_SMART_FAN_MODE_EVENT` і публікує режим, а маленька програма **FnQOSD** показує підказку на екрані, як на Windows.
+### 6. Fn+Q: режими живлення Legion (Тихий / Збалансований / Продуктивність)
+На Legion клавіші **Fn+Q** перемикають режим живлення, і колір кнопки живлення змінюється: синій, білий або червоний. Перемикає вбудований контролер (EC) сам, але macOS про це нічого не знала.
+- **FnQNotify.kext** (власний): ловить WMI-подію Lenovo `LENOVO_GAMEZONE_SMART_FAN_MODE_EVENT` (notify 0xE3), читає поточний режим (`GetSmartFanMode`) і публікує його в IORegistry. Він нічого не змінює, лише читає.
+- **FnQOSD** (маленька програма в автозапуску, `~/Library/LaunchAgents`): показує на екрані підказку, як у Windows.
+- Режим «Продуктивність» (червоний) дає найвищі ліміти CPU. Усі бали вище виміряні в ньому, від мережі.
 
-### 7. Google Chrome без мерехтіння
-На NVMTL Chrome за замовчуванням малює через ANGLE Metal + **Skia Graphite**, і з'являлися мерехтіння/смуги.
-- `--use-angle=gl` прибирає мерехтіння, але це **повністю програмний рендеринг** (chrome://gpu: «Software only»). YouTube стає менш плавним.
-- **Правильний варіант:** `--disable-features=SkiaGraphite`. GPU лишається (Compositing / Rasterization / Video Decode / WebGL — *Hardware accelerated*, бекенд GaneshGL через ANGLE Metal), мерехтіння немає.
-- У Chrome 155 для Mac пункту `use-angle` у chrome://flags вже немає, тому прапорець задається обгорткою (див. інструкцію нижче).
+![Підказка Fn+Q](fnq-osd.png)
+
+### 7. Google Chrome і мерехтіння
+Із драйвером NullMoth Chrome за замовчуванням мерехтить (ANGLE Metal + Skia Graphite). Перевірені варіанти:
+
+| Прапорці Chrome | Мерехтіння | Плавність |
+|---|---|---|
+| за замовчуванням | є | висока |
+| `--use-angle=gl` | немає | гірша (усе малює процесор, відео теж) |
+| `--disable-features=SkiaGraphite` | є (після перезавантаження) | висока |
+| `+ --disable-gpu-rasterization` | рідко | висока ✅ *поточний вибір* |
+| `+ --disable-gpu-compositing` | немає | трохи гірша (відео лишається апаратним) |
+
+Не допомогли: `NVMTL_SCHEDULE_AFTER_SURFACE_WRITES=1` і вимкнення апаратного декодування відео. У Chrome 155 для Mac пункту `use-angle` у chrome://flags уже немає, тому прапорці задаються обгорткою (див. інструкцію).
 
 ---
 
@@ -141,7 +165,7 @@ EC перемикає режим сам. Власний **FnQNotify.kext** ло�
 ### D. Chrome без мерехтіння, але з GPU
 1. Створіть AppleScript-програму `~/Applications/Chrome GL.app`:
    ```applescript
-   property flags : "--disable-features=SkiaGraphite"
+   property flags : "--disable-features=SkiaGraphite --disable-gpu-rasterization"
    on chromeRunning()
        return (do shell script "pgrep -x 'Google Chrome' >/dev/null && echo 1 || echo 0") is "1"
    end chromeRunning
@@ -163,7 +187,7 @@ EC перемикає режим сам. Власний **FnQNotify.kext** ло�
 3. В `Info.plist` додайте `CFBundleURLTypes` (http, https) і `LSUIElement = true`, іконку візьміть з Chrome, підпишіть: `codesign --force --deep -s - ~/Applications/"Chrome GL.app"`.
 4. Покладіть «Chrome GL» у Dock замість Chrome і зробіть його браузером за замовчуванням. Тоді посилання з інших програм теж відкриваються в Chrome з потрібним прапорцем.
 5. У налаштуваннях Chrome увімкніть «Продовжити з того місця, де ви зупинилися».
-6. Перевірка: chrome://gpu → *Skia Graphite: Disabled*, Compositing *Hardware accelerated*.
+6. Перевірка: chrome://gpu → *Skia Graphite: Disabled*, Rasterization *Software only*, Compositing *Hardware accelerated*. Якщо мерехтіння ще є, додайте `--disable-gpu-compositing`.
 
 ### E. Що НЕ варто робити
 - Не запускайте Chrome напряму з Launchpad/Spotlight, коли він закритий: стартує без прапорця.
