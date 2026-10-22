@@ -1,0 +1,41 @@
+--- osapi.c	2026-10-22 02:10:17
++++ osapi.c	2026-10-22 02:10:17
+@@ -2064,7 +2064,7 @@
+     NV_STATUS          rmStatus;
+     RM_API            *pRmApi;
+     THREAD_STATE_NODE  threadState;
+-    NV0000_CTRL_SYSTEM_GPS_CONTROL_PARAMS gpsControl = { 0 };
++    NV0000_CTRL_SYSTEM_PFM_REQ_HNDLR_CONTROL_PARAMS gpsControl = { 0 };
+ 
+     pRmApi = RmUnixRmApiPrologue(pNv, &threadState, RM_LOCK_MODULES_ACPI);
+     if (pRmApi == NULL)
+@@ -2072,11 +2072,14 @@
+         return;
+     }
+ 
+-    gpsControl.command = NV0000_CTRL_CMD_SYSTEM_GPS_DATA_INIT_USING_SBIOS_AND_ACK;
+-    gpsControl.locale  = NV0000_CTRL_CMD_SYSTEM_GPS_LOCALE_SYSTEM;
++    gpsControl.command = NV0000_CTRL_CMD_SYSTEM_PFM_REQ_HNDLR_DATA_INIT_USING_SBIOS_AND_ACK;
++    gpsControl.locale  = NV0000_CTRL_CMD_SYSTEM_PFM_REQ_HNDLR_LOCALE_SYSTEM;
+ 
+     //
+-    // NV0000_CTRL_CMD_SYSTEM_GPS_CONTROL is not a subdevice command.
++    // NV0000_CTRL_CMD_SYSTEM_GPS_CONTROL is an empty stub in this RM (client_resource.c); the platform request
++    // handler behind it is reached through NV0000_CTRL_CMD_SYSTEM_PFM_REQ_HNDLR_CONTROL, same command and locale.
++    //
++    // NV0000_CTRL_CMD_SYSTEM_PFM_REQ_HNDLR_CONTROL is not a subdevice command.
+     // But, Inside GPS module, the first GPU, which has GPS
+     // enabled will be grabbed with GPU manager. The RMAPI_API_LOCK_INTERNAL
+     // will internally grab the GPU locks and wake-up all the GPUs. Ideally
+@@ -2086,9 +2089,9 @@
+     rmStatus = pRmApi->Control(pRmApi,
+                                pNv->rmapi.hClient,
+                                pNv->rmapi.hClient,
+-                               NV0000_CTRL_CMD_SYSTEM_GPS_CONTROL,
++                               NV0000_CTRL_CMD_SYSTEM_PFM_REQ_HNDLR_CONTROL,
+                                (void *)&gpsControl,
+-                               sizeof(NV0000_CTRL_SYSTEM_GPS_CONTROL_PARAMS));
++                               sizeof(NV0000_CTRL_SYSTEM_PFM_REQ_HNDLR_CONTROL_PARAMS));
+ 
+     RmUnixRmApiEpilogue(pNv, &threadState);
+ 

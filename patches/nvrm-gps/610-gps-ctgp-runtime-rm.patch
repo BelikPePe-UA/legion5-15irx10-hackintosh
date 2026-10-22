@@ -1,0 +1,33 @@
+--- platform_request_handler_ctrl.c	2026-10-22 01:56:27
++++ platform_request_handler_ctrl.c	2026-10-22 01:56:27
+@@ -2451,10 +2451,13 @@
+             }
+         }
+ 
+-        // 3. Platform static customization for user config TGP can be handled here one time
++        //
++        // 3. Platform static customization for user config TGP: at init, and again on each GPS status change once
++        // enabled, so a platform whose cTGP follows a run-time power mode (laptop Fn+Q) gets the new offset applied
++        //
+         if ((pPfmreqhndlrData->PFMREQHNDLRACPIData.bPlatformUserConfigTGPSupport) &&
+-            (!pPlatformRequestHandler->controlData.bPlatformUserConfigTGPmodeEnabled) &&
+-            (bInit))
++            (bInit ? !pPlatformRequestHandler->controlData.bPlatformUserConfigTGPmodeEnabled
++                   : pPlatformRequestHandler->controlData.bPlatformUserConfigTGPmodeEnabled))
+         {
+             lclStatus = _pfmreqhndlrHandleUserConfigurableTgpModePlatformCustomization(pPlatformRequestHandler, pGpu);
+             if ((NV_OK != lclStatus) &&
+@@ -2758,6 +2761,13 @@
+     //Set the customization config tgp delta
+     if (FLD_TEST_DRF(0000_CTRL_PFM_REQ_HNDLR, _PSHARE_PARAMS_STATUS, _CTGP, _TRUE, pshareParams.status))
+     {
++        // Already applied: nothing to send
++        if (pPlatformRequestHandler->controlData.bPlatformUserConfigTGPmodeEnabled &&
++            (pPlatformRequestHandler->sensorData.PFMREQHNDLRACPIData.platformLimitDeltamW == pshareParams.ctgp))
++        {
++            goto _pfmreqhndlrHandleUserConfigurableTgpModePlatfromCustomization_exit;
++        }
++
+         // Cached the platform limit delta in the PlatformRequestHandler ACPI cache
+         pPlatformRequestHandler->sensorData.PFMREQHNDLRACPIData.platformLimitDeltamW = pshareParams.ctgp;
+ 

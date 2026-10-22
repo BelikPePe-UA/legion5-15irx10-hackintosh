@@ -1,0 +1,167 @@
+--- os-xnu2.cpp	2026-10-22 01:17:33
++++ os-xnu2.cpp	2026-10-22 01:56:43
+@@ -19,6 +19,7 @@
+ #include <sys/uio.h>
+ #include <IOKit/IOSubMemoryDescriptor.h>
+ #include <IOKit/acpi/IOACPIPlatformDevice.h>
++#include <IOKit/IOMessage.h>
+ #include <sys/proc.h>
+ #include <sys/kauth.h>
+ #include <libkern/crypto/sha1.h>
+@@ -1428,7 +1429,95 @@
+ #define NV_XNU_MAX_ACPI_DSM_PARAM_SIZE 1024                                                  // NV_MAX_ACPI_DSM_PARAM_SIZE (nv-linux.h)
+ static const NvU8 nv_xnu_nbci_guid[16] = { 0x75, 0x0B, 0xA5, 0xD4, 0xC7, 0x65, 0xF7, 0x46,      // NBCI_DSM_GUID_STR
+                                            0xBF, 0xB7, 0x41, 0x51, 0x4C, 0xEA, 0x02, 0x44 };    // (acpidsmguids.h)
++// GPS (GPU power steering) _DSM, one GUID for revisions 1.x and 2.x. RM's platform request handler asks it for
++// PSHAREPARAMS and hands the firmware's configurable-TGP offset to the GPU (CONFIGURE_TURBO_V2). Without it the GPU runs
++// at the VBIOS default power limit whatever power mode the laptop is in. Opt-in: boot-arg nvrmgps=1.
++static const NvU8 nv_xnu_gps_guid[16] = { 0x01, 0x2D, 0x13, 0xA3, 0xDA, 0x8C, 0xBA, 0x49,       // GPS_DSM_GUID_STR
++                                          0xA5, 0x2E, 0xBC, 0x9D, 0x46, 0xDF, 0x6B, 0x81 };     // (acpidsmguids.h)
++static int nv_xnu_acpi_gps_level(void)   // nvrmgps=1: pass GPS through; nvrmgps=2: also supply the laptop's cTGP
++{
++    static int lvl = -1;
++    if (lvl < 0) { int v = 0; lvl = PE_parse_boot_argn("nvrmgps", &v, sizeof(v)) ? (v >= 2 ? 2 : (v == 1 ? 1 : 0)) : 0; }
++    return lvl;
++}
++static bool nv_xnu_acpi_gps_on(void) { return nv_xnu_acpi_gps_level() > 0; }
+ 
++// Lenovo Legion: this firmware's GPS answers only the GPU temperature target; the configurable TGP is handed out by
++// NVPCF, which RM leaves to a closed user-space service. nvrmgps=2 adds the cTGP to GPS PSHAREPARAMS so RM applies it
++// itself (CONFIGURE_TURBO_V2). Offset in mW over the VBIOS default limit: boot-arg nvrmctgp=<mW>, or by the Legion
++// power mode (WMI GetSmartFanMode on \_SB.GZFD, the Fn+Q mode) from the firmware's own cTGP table: 50/65/100 W.
++static bool nv_xnu_lenovo_mode(NvU32 *mode)
++{
++    IORegistryEntry *e = IORegistryEntry::fromPath("IOACPIPlane:/_SB/GZFD");
++    IOACPIPlatformDevice *gz = OSDynamicCast(IOACPIPlatformDevice, e);
++    bool ok = false;
++    if (gz && gz->validateObject("WMAA") == kIOReturnSuccess) {
++        OSObject *args[3] = { OSNumber::withNumber(0ULL, 8), OSNumber::withNumber(0x2DULL, 32), OSNumber::withNumber(0ULL, 32) };
++        OSObject *res = NULL;
++        if (args[0] && args[1] && args[2] && gz->evaluateObject("WMAA", &res, args, 3) == kIOReturnSuccess)
++            if (OSNumber *n = OSDynamicCast(OSNumber, res)) { *mode = n->unsigned32BitValue(); ok = true; }
++        for (OSObject *a : args) OSSafeReleaseNULL(a);
++        OSSafeReleaseNULL(res);
++    }
++    OSSafeReleaseNULL(e);
++    return ok;
++}
++static bool nv_xnu_ctgp_mw(NvU32 *mw, NvU32 *mode)
++{
++    int v = 0; *mode = 0;
++    if (PE_parse_boot_argn("nvrmctgp", &v, sizeof(v)) && v >= 0 && v <= 65000) { *mw = (NvU32)v; return true; }
++    if (!nv_xnu_lenovo_mode(mode)) return false;
++    switch (*mode) {
++        case 1: *mw = 0; return true;                    // Quiet: cTGP 50 W
++        case 2: case 0xFF: *mw = 15000; return true;     // Balanced / Custom: 65 W
++        case 3: case 0xE0: *mw = 50000; return true;     // Performance / Extreme: 100 W
++        default: return false;
++    }
++}
++
++// Fn+Q at run time. RM reads the cTGP when it starts and again on a GPS status change (ACPI notify 0xC0 on the GPU,
++// which this firmware never sends for a power-mode change). tools/fnq FnQNotify (IOService "FnQNotify") messages its
++// interested clients with kIOMessageServicePropertyChange after each Fn+Q; on that we raise the status change, RM asks
++// PSHARESTATUS/PSHAREPARAMS again and the cTGP of the new mode goes to the GPU. 500 ms delay: a run of presses is one
++// event. The interest notifier and the thread call stay for the life of the kext, like the ACPI node cache below.
++static nv_state_t *nv_xnu_gps_nv;
++static thread_call_t nv_xnu_gps_call;
++static void nv_xnu_gps_fire(thread_call_param_t, thread_call_param_t)
++{
++    NvU32 mw = 0, mode = 0;
++    if (!nv_xnu_ctgp_mw(&mw, &mode)) return;
++    IOLog("NVRM-xnu: GPS Fn+Q: Legion mode %u, status change to RM (cTGP +%u mW)\n", mode, mw);
++    rm_acpi_notify(NULL, nv_xnu_gps_nv, 0xC0 /* ACPI_NOTIFY_GPS_STATUS_CHANGE */);
++}
++static IOReturn nv_xnu_fnq_message(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
++{
++    if (type == kIOMessageServicePropertyChange) {
++        uint64_t deadline;
++        clock_interval_to_deadline(500, kMillisecondScale, &deadline);
++        thread_call_enter_delayed(nv_xnu_gps_call, deadline);
++    }
++    return kIOReturnSuccess;
++}
++static bool nv_xnu_fnq_published(void *, void *, IOService *svc, IONotifier *)
++{
++    static IONotifier *interest;
++    if (!interest) {
++        interest = svc->registerInterest(gIOGeneralInterest, nv_xnu_fnq_message, NULL, NULL);
++        IOLog("NVRM-xnu: GPS Fn+Q watch %s\n", interest ? "on" : "FAILED");
++    }
++    return true;
++}
++static void nv_xnu_gps_watch_fnq(nv_state_t *nv)   // first GPS call under nvrmgps=2 (RM is up, nv is the GPU)
++{
++    if (nv_xnu_gps_nv) return;
++    nv_xnu_gps_nv = nv;
++    nv_xnu_gps_call = thread_call_allocate(nv_xnu_gps_fire, NULL);
++    OSDictionary *m = IOService::serviceMatching("FnQNotify");
++    if (m && nv_xnu_gps_call && !IOService::addMatchingNotification(gIOFirstPublishNotification, m, nv_xnu_fnq_published, NULL))
++        IOLog("NVRM-xnu: GPS Fn+Q watch FAILED (notification)\n");
++    OSSafeReleaseNULL(m);
++}
++
+ // The GPU's ACPI node: AppleACPIPCI puts its IOACPIPlane path on the PCI device as "acpi-path".
+ // Cached per GPU (PCI address), kept retained for the life of the kext: a PC with two NVIDIA cards must ask each
+ // card's own ACPI node, never the first one found.
+@@ -1523,16 +1612,23 @@
+                                          void *pOutData, NvU16 *pSize)
+ {
+     TRC;
+-    if (!nv_xnu_acpi_backlight_on()) return NV_ERR_NOT_SUPPORTED;
++    const bool gps = !acpiNvpcfDsmFunction && pAcpiDsmGuid && nv_xnu_acpi_gps_on() &&
++                     memcmp(pAcpiDsmGuid, nv_xnu_gps_guid, sizeof nv_xnu_gps_guid) == 0;
++    if (!gps && !nv_xnu_acpi_backlight_on()) return NV_ERR_NOT_SUPPORTED;
++    if (gps && nv && nv_xnu_acpi_gps_level() >= 2) nv_xnu_gps_watch_fnq(nv);
+     if (!pAcpiDsmGuid || !pInParams || inParamSize > NV_XNU_MAX_ACPI_DSM_PARAM_SIZE || !pOutData || !pSize)
+         return NV_ERR_INVALID_ARGUMENT;
+-    if (acpiNvpcfDsmFunction || memcmp(pAcpiDsmGuid, nv_xnu_nbci_guid, sizeof nv_xnu_nbci_guid) != 0 ||
++    if (!gps && (acpiNvpcfDsmFunction || memcmp(pAcpiDsmGuid, nv_xnu_nbci_guid, sizeof nv_xnu_nbci_guid) != 0 ||
+         (acpiDsmSubFunction != 0 /* NV_ACPI_ALL_FUNC_SUPPORT */ && acpiDsmSubFunction != NV_NBCI_FUNC_GETOBJBYTYPE &&
+-         acpiDsmSubFunction != NV_NBCI_FUNC_GETBACKLIGHT))
++         acpiDsmSubFunction != NV_NBCI_FUNC_GETBACKLIGHT)))
+         return NV_ERR_NOT_SUPPORTED;
+     IOACPIPlatformDevice *acpi = nv_xnu_gpu_acpi(nv);
+     if (!acpi) return NV_ERR_NOT_SUPPORTED;
+ 
++    // RM passes one buffer as both input and output (osCallACPI_DSM pInOut), so the input word is gone once the
++    // result is copied back; keep it for the PSHAREPARAMS query-type check and the log line.
++    NvU32 in0 = 0;
++    if (inParamSize >= 4) memcpy(&in0, pInParams, 4);
+     OSObject *args[4] = { OSData::withBytes(pAcpiDsmGuid, 16), OSNumber::withNumber(acpiDsmRev, 32),
+                           OSNumber::withNumber(acpiDsmSubFunction, 32),
+                           inParamSize ? OSData::withBytes(pInParams, inParamSize) : OSData::withCapacity(1) };
+@@ -1549,6 +1645,33 @@
+     // One line per subfunction, every GETBACKLIGHT call. A flat cap of 8 lines was spent by the support query and
+     // the GETOBJBYTYPE fetches at GPU start, so a laptop log never showed whether the backlight table was asked for.
+     // For the support query the first word is the firmware's subfunction bitmask (bit 0x14 = GETBACKLIGHT).
++    if (gps && st == NV_OK && nv_xnu_acpi_gps_level() >= 2) {
++        if (acpiDsmSubFunction == 0x20 /* GPS_FUNC_PSHARESTATUS */ && *pSize >= 4) {
++            NvU32 w0; memcpy(&w0, pOutData, 4); w0 |= 1u << 20;   // PLAT_USER_CONFIG_TGP_MODE_SUPPORT
++            memcpy(pOutData, &w0, 4);
++        } else if (acpiDsmSubFunction == 0x2A /* GPS_FUNC_PSHAREPARAMS */ && *pSize >= 16 && inParamSize >= 4) {
++            NvU32 mw = 0, mode = 0;
++            if ((in0 & (1u << 15)) && nv_xnu_ctgp_mw(&mw, &mode)) {          // RM asked for the cTGP
++                NvU32 w[4]; memcpy(w, pOutData, sizeof w);
++                w[0] |= 1u << 15; w[3] = mw;                                 // status CTGP, ctgp offset (mW)
++                memcpy(pOutData, w, sizeof w);
++                IOLog("NVRM-xnu: GPS cTGP supplied: +%u mW (Legion mode %u)\n", mw, mode);
++            }
++        }
++    }
++    if (gps) {
++        // Every GPS call: subfunction, revision, status, size and the first four words (PSHAREPARAMS: status,
++        // version, tGpu, ctgp offset in mW). Capped so a periodic caller cannot flood the log.
++        static unsigned gpsLines;
++        if (gpsLines < 64) {
++            gpsLines++;
++            NvU32 w[4] = { 0, 0, 0, 0 };
++            if (st == NV_OK) memcpy(w, pOutData, *pSize < sizeof w ? *pSize : sizeof w);
++            IOLog("NVRM-xnu: GPS _DSM rev 0x%x func 0x%x in %08x -> 0x%x (%u B) %08x %08x %08x %08x\n", acpiDsmRev,
++                    acpiDsmSubFunction, in0, st, (unsigned)*pSize, w[0], w[1], w[2], w[3]);
++        }
++        return st;
++    }
+     static NvU32 loggedMask;
+     const NvU32 bit = 1u << (acpiDsmSubFunction & 31);
+     if (acpiDsmSubFunction == NV_NBCI_FUNC_GETBACKLIGHT || !(loggedMask & bit)) {
